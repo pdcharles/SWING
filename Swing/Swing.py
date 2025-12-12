@@ -3,6 +3,9 @@ import pandas as pd
 import numpy as np
 import warnings
 from scipy import stats
+import dask.dataframe as dd #use dask to allow parallelised aggregation during edge lumping
+import pyarrow #prevents pandas from somehow failing to import pyarrow (required for conversion to dask)
+from tqdm.dask import TqdmCallback #better jupyter progress bar
 
 from .Window import Window
 from .RFRWindow import RandomForestRegressionWindow
@@ -375,7 +378,7 @@ class Swing(object):
 
         :return:
         """
-        if self.window_type is "Lasso":
+        if self.window_type == "Lasso":
             for window in self.window_list:
                 window.initialize_params(alpha=self.alpha)
         else:
@@ -409,10 +412,7 @@ class Swing(object):
                 if pcs is not None:
                     window.num_pcs = pcs
             if show_progress:
-                if window.td_window:
-                    print("Fitting window index %i against the following window indices: ")
-                else:
-                    print("Fitting window {} of {}".format(window.nth_window, self.get_n_windows()))
+                print("Fitting window {} of {}".format(window.nth_window+1, self.get_n_windows()))
             window.fit_window()
 
         return self.window_list
@@ -512,9 +512,9 @@ class Swing(object):
 
             current_df['adj_imp'] = np.abs(current_df['Importance'])
 
-            if self.window_type is "Dionesus":
+            if self.window_type == "Dionesus":
                 current_df['adj_imp'] = np.abs(current_df['Importance'])
-            elif self.window_type is "Lasso":
+            elif self.window_type == "Lasso":
                 current_df['adj_imp'] = np.abs(current_df['Stability'])
             current_df.sort_values(['adj_imp'], ascending=False, inplace=True)
 
@@ -523,7 +523,7 @@ class Swing(object):
             if df is None:
                 df = current_df.copy()
             else:
-                df = df.append(current_df.copy(), ignore_index=True)
+                df = pd.concat([df,current_df.copy()], ignore_index=True)
 
         if not self_edges:
             df = df[df.Parent != df.Child]
@@ -540,7 +540,8 @@ class Swing(object):
         Make a dictionary of edges
         :return:
         """
-        print("Lumping edges...", end='')
+        print("Lumping edges\n", end='')
+
         df = self.full_edge_list.copy()
 
         # Only keep edges with importance > 0. Values below 0 are not helpful for model building
@@ -561,29 +562,68 @@ class Swing(object):
         # Identify edges that could exist, but do not appear in the inferred list
         edge_diff = full_edge_set.difference(edge_set)
 
+        # Identify edges that do appear in the inferred list
+        edge_shared = full_edge_set.intersection(edge_set)
+
         self.edge_dict = {}
         lag_importance_score, lag_lump_method = lag_method.split('_')
         score_method = eval('np.'+lag_importance_score)
         lump_method = eval('np.'+lag_lump_method)
-        for idx, edge in enumerate(full_edge_set):
-            if idx % 1000 == 0:
-                print(str(idx)+" out of "+ str(len(full_edge_set)), end='')
-            if edge in edge_diff:
-                self.edge_dict[edge] = {"dataframe": None, "mean_importance": 0,
-                                        "max_importance": 0, 'max_edge': None, 'lag_importance': 0,
-                                        'lag_method': lag_method, 'rank_importance': np.nan, 'adj_importance': 0}
-                continue
 
-            current_df = df[df['Edge'] == edge]
-            max_idx = current_df['Importance'].idxmax()
-            lag_set = list(set(current_df.Lag))
-            lag_imp = score_method([lump_method(current_df.Importance[current_df.Lag == lag]) for lag in lag_set])
-            lag_adj_imp = score_method([lump_method(current_df.adj_imp[current_df.Lag == lag]) for lag in lag_set])
-            lag_rank = score_method([lump_method(current_df.Rank[current_df.Lag == lag]) for lag in lag_set])
-            self.edge_dict[edge] = {"dataframe":current_df, "mean_importance":np.mean(current_df.Importance), "max_importance":current_df.Importance[max_idx],
-                                    'max_edge':(current_df.P_window[max_idx], current_df.C_window[max_idx]),
-                                    'lag_importance': lag_imp, 'lag_method':lag_method,
-                                    'rank_importance': lag_rank, 'adj_importance':lag_adj_imp}
+        # Only need to loop on intersecting edges
+
+        print("Total Edges: Inferred: "+ str(len(edge_shared)) +"; Possible, but not Inferred: "+ str(len(edge_diff)) +  "\n", end='')
+        print("Processing Inferred edges\n")
+
+        meta = pd.DataFrame(columns=['mean_importance','max_importance','max_edge','lag_importance','lag_method','rank_importance','adj_importance'])
+        meta.mean_importance = meta.mean_importance.astype(np.float64)
+        meta.max_importance = meta.max_importance.astype(np.float64)
+        meta.max_edge = meta.max_edge.astype(np.bytes_)
+        meta.lag_importance = meta.lag_importance.astype(np.float64)
+        meta.lag_method = meta.lag_method.astype(np.bytes_)
+        meta.rank_importance = meta.rank_importance.astype(np.int64)
+        meta.adj_importance = meta.adj_importance.astype(np.float64)
+
+        def agg_func(grouped):
+            mean_importance = np.mean(grouped.Importance)
+            max_idx = grouped['Importance'].idxmax()
+            max_importance = grouped.Importance[max_idx]
+            max_edge = (grouped.P_window[max_idx], grouped.C_window[max_idx])
+            lag_set = list(set(grouped.Lag))
+            lag_imp = score_method([lump_method(grouped.Importance[grouped.Lag == lag]) for lag in lag_set])
+            lag_adj_imp = score_method([lump_method(grouped.adj_imp[grouped.Lag == lag]) for lag in lag_set])
+            lag_rank = score_method([lump_method(grouped.Rank[grouped.Lag == lag]) for lag in lag_set])
+            return pd.Series(data={
+                                    'mean_importance':mean_importance,
+                                    'max_importance':max_importance,
+                                    'max_edge':max_edge,
+                                    'lag_importance':lag_imp,
+                                    'lag_method':lag_method,
+                                    'rank_importance':lag_rank,
+                                    'adj_importance':lag_adj_imp
+                                  })
+
+        df.index = pd.MultiIndex.from_tuples(df['Edge'])
+        df_shared = df.loc[list(edge_shared),:].copy().reset_index(drop=True)
+        ddf = dd.from_pandas(df_shared, npartitions=6)
+        with TqdmCallback(desc="compute"):
+            out = ddf.groupby(['Edge']).apply(agg_func,meta=meta).compute()
+        out.index = pd.MultiIndex.from_tuples([eval(s) for s in out.index]) #Annoyingly, dask returns the multiindex as string
+        self.edge_dict = out.to_dict(orient='index')
+
+        print("[DONE]\n")
+
+        # Possible but unobserved edges
+
+        print("Possible, but not Inferred edges:\n", end='')
+
+        for idx, edge in enumerate(edge_diff):
+            if idx % 1000 == 0:
+                print(" ... "+str(idx)+" out of "+ str(len(full_edge_set)), end='')
+            self.edge_dict[edge] = {"dataframe": None, "mean_importance": 0,
+                                    "max_importance": 0, 'max_edge': None, 'lag_importance': 0,
+                                    'lag_method': lag_method, 'rank_importance': np.nan, 'adj_importance': 0}
+
         print("...[DONE]")
         if edge_diff:
             message = 'The last %i edges had no meaningful importance score' \
